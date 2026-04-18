@@ -1,0 +1,74 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# Compiled object files and libraries
+*.o
+*.a
+*.so
+*.dylib
+
+# CUDA compilation artifacts
+*.ptx
+*.cubin
+*.fatbin
+*.sass
+*.cuobjdump
+
+# Compiled executables (common names in this project)
+llama_skel
+test_rmsnorm
+test_rope
+test_swiglu
+test_sampling
+test_attn
+playground/kernels/flash_attn
+playground/kernels/test_calc_QKT
+playground/kernels/gemm_16m8n16k
+playground/run_ptx
+
+# cscope / ctags index files
+cscope.out
+cscope.in.out
+cscope.po.out
+tags
+TAGS
+
+# CMake cache and generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# Model weights and large data files
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+
+# Scratch and temporary files
+*.tmp
+temp.out
+*.log
+
+# IDE / editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python cache (for any helper scripts)
+__pycache__/
+*.pyc
+*.pyo
+
+# Tool marker files
+.codex
+.sixth/

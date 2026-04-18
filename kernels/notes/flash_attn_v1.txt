@@ -1,0 +1,198 @@
+# Flash Attention v1
+
+## Algorithm:
+
+### Forward:
+1. Divide full Q, K, V into blocks; such that Br = row_dimension(Qi) = Total Q dimension/ N; N chosen such that; Bc = row_dimension(Kj, Vj) = Total K, V dimension/ M; M chosen such that (see section: How to divide the attention problem across GPU -- thoughts)
+2. 
+for every Head H
+    for j in K, V blocks: K(j), V(j) from HBM
+      for i in Q blocks: Q(i)
+          m`(i), l`(i) -> from HBM
+          score(i,j) = Q(i)trans(K(j)) -> SRAM
+          m(i) = max(rowmax(score(i, j)), m'(i)) -> registers
+          l(i) = rowsum(e^((si,j + m'(i) - m(i)))) + l'(i) (e^(m(i) - m`(i))) -> registers
+          O(i) = O`(i) (e^(-m(i) + m`(i))) + e^((si,j + m'(i) - m(i)))V -> to HBM
+          m'(i) = m(i) -> to HBM
+          l'(i) = l(i) -> to HBM
+
+    Final O(i) = O(i) * (1/l(i)) -> from HBM to HBM -> Split between blocks again (l(i) is elementwise and can include mask -- diagonal matrix with value duplication)
+
+#### Notes
+-- KV cache --> make sure already fecthed K,V are not fecthed again from memory -- for eg: For GQA, exploit same K,V head for multiple Q heads
+    -- an make Q multiple rows instead of 1 row -- better compute util as well
+-- 
+
+#### Forward GPU pseudocode
+Q laid out as B,S, H * DHeadDim; K, V laid out as B,S, K * DHeaddim; Each head will be a different block? Better if on same SM, so same block -- later
+mma each -> 16mx8nx16k; per mma --> (4 + 2 + 4) 32-bit registers = 40 bytes
+need to split such that n warps do: rowtot = Br/16; columntot = Bc/8; Ktot = DHeadDim/16; let us do 4 warps; each warp rowtot/4, columntot/4
+n warps -- 1 block, n warps -> share mem, registers (usually not the bottleneck?)
+
+// Each block should have self contained resources depending on HW
+// L1 shared mem --> Fit, Q, K, V, scores matrices -- 4 matrices --> shared mem = (Br * DHeadDim) + (Bc * DHeadDim * 2) + (Br * Bc)
+/*
+    Qstart = Qb + Hidx * DHeadDim
+    Kstart = Kb + Kidx * DHeadDim
+    Vstart = Vb + Kidx * DHeadDim
+    Ostart = Ob + Hidx * DHeadDim
+*/
+
+// Assuming  shapes:
+// Q : [B, S', H, DHeadDim]
+// K : [B, S, K, DHeadDim]
+// V : [B, S, K, DHeadDim]
+// S' = S during prefill
+flash_attention_kernel(Q, K, V, DHeaddim, batch_size, num_q_heads, num_kv_heads):
+    Br = 
+    // load into shared mem
+    Q_shared_mem_arr = Qb: size(Br * DHeadDim)
+    K_shared_mem_arr = Kb: size(Bc * DHeadDim)
+    V_shared_mem_arr = Vb: size(Bc * DHeadDim)
+
+
+flash_attention_block_kernel(Qb, Kb, Vb, Ob, DHeadDim, rq, rkv, q_heads, kv_heads, Br, Bc, Mi, Li):
+    warpId = threadIdx.x / 32
+    // Use multiple warps for pipelining
+
+    // grouping q heads\
+    //g_q = q_heads / kv_heads
+
+    scores_arr = init: size(Br * Bc)
+
+    Br_tile = ((Br / 16) > 0) ? : (Br / 16) : 1
+    Bc_tile = ((Bc / 8) > 0) ? : (Bc / 8) : 1
+
+    if Bc_tile > blockdim.x:
+        warps_cnt = blockdim.x
+    else:
+        warps_cnt = Bc_tot
+
+    c_col_tiles = Bc_tile / warps_cnt
+    c_row_tiles = Br / 16
+
+    // for warp in warpId:
+    Q_shared_mem_addr = Qb
+    K_shared_mem_addr = Kb + warp * c_col_tiles * DHeadDim * sizeof(uint16_t)
+    scores_addr = scores_arr
+
+    // Q block dim -- [Br, DHeadDim]; K, V block dim -- [Bc, DHeadDim]
+    // compute Br x Bc tile of QK^T using mma warp level
+    __sync_threads__
+    // score_ij is 16x8 or q_row_dimx8
+    score_ij = calc_qktrans_warp(Q_shared_mem_addr, K_shared_mem_addr, scores_addr, DHeadDim, c_row_tiles, c_col_tiles, warps_cnt)
+    __sync_threads__
+    Min = max(rowmax(score_ij), Mi)
+    Lin = rowsum(e^((s_ij + Min - Mi))) + Li (e^(Min - Mi))
+    // O(i) = O`(i) (e^(-m(i) + m`(i))) + e^((si,j + m'(i) - m(i)))V
+    block_apply_attn_weights(V_shared_mem_arr, Min, Mi, score_ij, Ob)
+    Li = Lin
+    Mi = Min
+
+
+    // write back to HBM
+
+block_apply_attn_weights(V_shared_mem_arr, Min, Mi, score_ij, Ob):
+    ldmatrix()
+
+
+// Things to take care of later -- element size and other corner cases, eg: for inference q --> 1 row
+func calc_qktrans_warp(
+    Q,
+    K,
+    C,
+    DHeadDim,
+    c_row_tiles,
+    c_col_tiles,
+    warps_cnt
+):
+    qk_tile_bytes = 16 * sizeof(uint16_t);
+    c_tile_bytes  =  8 * sizeof(float);
+    k_tiles = (DHeadDim >> 4)
+    warpId = threadIdx.x / 32
+
+    for rb in c_row_tiles:
+        for cb in c_col_tiles:
+            for k in k_tiles:
+                q_tile_ptr = Q+ rb * qk_tile_bytes * DHeadDim       + k * qk_tile_bytes
+                k_tile_ptr = K + cb * qk_tile_bytes * (DHeadDim / 2) + k * qk_tile_bytes
+                c_tile_ptr = C + rb * c_tile_bytes * warps_cnt * c_col_tiles * 16 + cb * c_tile_bytes * warpId
+                ldmatrix.sync(Qmat_addr, DHeadDim) // 16x16
+                ldmatrix.sync(Kmat_addr, DHeadDim) // 16x8
+                scoreij = mma.sync(Q, KT, C)
+
+            // first row in C will be T0:c0,c1, T1:c0,c1, T2:c0,c1, T3:c0,c1 -- we need rowmax of these
+            float row_u = max(c_frag[0], c_frag[1]);
+            float row_l = max(c_frag[2], c_frag[3]);
+
+            // Thread 0 reduces and finds maxrow of row1 by accessing row_u of T0, T1, T2, T3
+            // i.e. Mn[rb * 16] = max(T0:row_u, T1:row_u, T2:row_u, T3:row_u, Mn[rb * 16])
+            // Similarly Thread 4 reduces and finds maxrow of row 2 by accessing row_u of T4, T5, T6, T7
+            // i.e. Mn[(rb * 16) + 1] = max(T4:row_u, T5:row_u, T6:row_u, T7:row_u, Mn[rb * 16 + 1])
+            // and so on until row8
+            // From row9 to row16, again T0, T4, T8 ... but with c2, c3 instead of c0, c1
+            // i.e. Mn[(rb * 16) + threadidx.x / 4] = max(T4:row_u, T5:row_u, T6:row_u, T7:row_u, Mn[rb * 16 + threadidx.x / 4])
+
+            // O(i) = O`(i) (e^(-m(i) + m`(i))) + e^((si,j + m'(i) - m(i)))V
+
+            // Ln[i] = rowsum(e^((s_ij + Min - Mi))) + Li (e^(Min - Mi))
+
+
+```
+
+### Parameters for GPU RTX 5070:
+1. Threads per warp = 32
+2. GPC = 5
+3. TPC = 24
+4. SM = 48
+5. Per SM:
+   - Tensor cores = 4
+   - CUDA cores = 128 FP32
+6. Shared memory / L1 per SM = 128KB
+7. Register file per SM = 256KB
+
+#### GPU Notes
+1. Block runs on an SM (many blocks per SM possible)
+   - Threads grouped into warps (32)
+   - Warp = scheduling + execution unit
+2. Number of blocks depends on how you tile the problem
+3. Grid   → divide problem
+   Block  → share memory + sync
+   Warp   → execute + schedule together
+   Thread → do work
+   MMA    → accelerate math
+   - gridDim  → how many blocks
+   - blockDim → how many threads per block
+
+
+4.
+If you want some work to stay on a single SM,
+you must put it inside one block
+
+If block is too big (uses too many resources):
+→ only 1 block may fit per SM
+
+If small:
+→ multiple blocks per SM (higher occupancy)
+
+#### How to divide the attention problem across GPU -- thoughts
+1. Inner loop is all chunks of Q,  outer loop is K, V chunks
+
+128 KB shared mem --> divide for K, Q, V, keep row on 1 SM, then number of rows for Q will be shared_mem size / ((4 * size of each number (fp16 is 2)) * d); where d is head dimension, number of K, V rows is number of Q rows
+This (occupying full shared mem) forces number of blocks on 1 SM to 1 i.e. only 1 block at a time on 1 SM...
+How to guarantee other resources are not depleted before shared mem?
+
+
+mma estimations for understanding
+Assume
+  Each block can do 32x32 tile
+  4 warps, each warp 16x16 sub tile (each mma is m16×n8×k16)
+
+K = D for attention, which is the Embedding dimension size (model size)
+Egs:
+If K = 128 and output subtile = 16x16:
+
+- one mma handles only 16x8x16
+- so 16x16 needs 2 mma per K-step
+- K=128 means 8 K-steps
+- total = 16 mma instructions per warp
