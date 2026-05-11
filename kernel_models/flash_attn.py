@@ -1,5 +1,5 @@
 """
-kern_models/flash_attn.py — Python model of kernels/flash_attn.cu
+kernel_models/flash_attn.py — Python model of kernels/flash_attn.cu
 
 Models the exact tile geometry, loop structure, and online softmax of the
 CUDA kernel using NumPy.  Each function corresponds 1-to-1 to a CUDA

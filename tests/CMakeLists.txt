@@ -139,7 +139,7 @@ if(NCU_EXECUTABLE)
         HINTS "${PYTHON_PATH}" /home/sviraaj/projects/AI/.venv/bin
         DOC "Python interpreter for bench_flash_attn2.py"
     )
-    set(NCU_SDPA_SCRIPT "${CMAKE_SOURCE_DIR}/tests/bench_flash_attn2.py")
+    set(NCU_SDPA_SCRIPT "${CMAKE_SOURCE_DIR}/reference_benchmarks/bench_flash_attn2.py")
 
     if(PYTHON_EXECUTABLE)
         add_custom_target(ncu_sdpa_discover

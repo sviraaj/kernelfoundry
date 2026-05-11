@@ -16,7 +16,7 @@ Decode mode (q_len=1):
   KV shape [B, H_kv, kv_len, D]  — full KV cache
 
 Run:
-    /home/sviraaj/projects/AI/.venv/bin/python tests/bench_flash_attn2.py
+    /home/sviraaj/projects/AI/.venv/bin/python reference_benchmarks/bench_flash_attn2.py
 """
 
 import sys
