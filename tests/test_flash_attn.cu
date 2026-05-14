@@ -22,7 +22,7 @@
 static constexpr float kTol = 5e-2f;
 
 static inline size_t flash_smem_bytes_for(int kv_block_rows, int D) {
-    return static_cast<size_t>(kFlashBr + 2 * kv_block_rows) * D * sizeof(uint16_t);
+    return static_cast<size_t>(kFlashBr + 4 * kv_block_rows) * D * sizeof(uint16_t);
 }
 
 static inline int select_flash_bc(int D) {

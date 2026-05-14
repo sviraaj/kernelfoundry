@@ -12,7 +12,7 @@ Each kernel ships with a NumPy reference model that mirrors the exact tile geome
 
 | Kernel | Status | Features |
 |--------|:------:|----------|
-| Flash Attention | ✅ v1 | GQA / MQA, m16n8k16 + m16n8k8 MMA, online softmax, decode (Q_len=1) |
+| Flash Attention | ✅ v2 | GQA / MQA, m16n8k16 + m16n8k8 MMA, online softmax, decode (Q_len=1), cp.async KV double-buffering, O/Mi/Li in registers |
 | RMSNorm | 🔲 | — |
 | RoPE | 🔲 | — |
 | SwiGLU | 🔲 | — |
@@ -21,27 +21,25 @@ Each kernel ships with a NumPy reference model that mirrors the exact tile geome
 
 ## Flash Attention — v1 Numbers
 
-**RTX 5070 · H_q=32, H_kv=8 (GQA 4:1), D=128, fp16 in / fp32 out**
+**RTX 5070 · H_q=32, H_kv=8 (GQA 4:1), D=128, fp16 in / fp32 out · v2 (O/Mi/Li in registers, cp.async KV double-buffering)**
 
 **Prefill** (Q_len = KV_len):
 
-| Seq len | Latency  | TFLOPS |
-|--------:|---------:|-------:|
-| 512     | 3.0 ms   | 1.42   |
-| 1024    | 10.4 ms  | 1.65   |
-| 2048    | 40.8 ms  | 1.69   |
-| 4096    | 162.6 ms | 1.69   |
+| Seq len | Latency   | TFLOPS |
+|--------:|----------:|-------:|
+| 512     |  0.931 ms |   4.61 |
+| 1024    |  3.251 ms |   5.29 |
+| 2048    | 12.221 ms |   5.62 |
+| 4096    | 44.515 ms |   6.18 |
 
 **Decode** (Q_len=1, full KV cache):
 
 | KV cache len | Latency  |
 |-------------:|---------:|
-| 512          | 0.32 ms  |
-| 1024         | 0.59 ms  |
-| 2048         | 1.12 ms  |
-| 4096         | 2.18 ms  |
-
-*v1 baseline — O accumulator currently round-trips to HBM per tile. Next: keep O in registers across the KV sweep.*
+| 512          | 0.082 ms |
+| 1024         | 0.148 ms |
+| 2048         | 0.286 ms |
+| 4096         | 0.571 ms |
 
 Compare with PyTorch FA2 (SDPA): `python reference_benchmarks/bench_flash_attn2.py`
 

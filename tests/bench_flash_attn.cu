@@ -20,7 +20,7 @@ static inline uint16_t f32_to_f16(float v) {
 }
 
 static inline size_t smem_bytes_for(int kv_block_rows, int D) {
-    return static_cast<size_t>(kFlashBr + 2 * kv_block_rows) * D * sizeof(uint16_t);
+    return static_cast<size_t>(kFlashBr + 4 * kv_block_rows) * D * sizeof(uint16_t);
 }
 
 static inline int select_bc(int D) {
@@ -30,6 +30,7 @@ static inline int select_bc(int D) {
     if (cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
         return -1;
     int bc = kFlashBcDefault;
+    // We are doing max_smem/2 instead of max_smem because the kernel may need to double-buffer KV tiles.
     while (bc >= kFlashBcMin && smem_bytes_for(bc, D) > static_cast<size_t>(max_smem))
         bc >>= 1;
     return (bc >= kFlashBcMin) ? bc : -1;
