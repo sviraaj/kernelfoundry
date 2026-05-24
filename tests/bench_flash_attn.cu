@@ -30,7 +30,7 @@ static inline int select_bc(int D) {
     if (cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
         return -1;
     int bc = kFlashBcDefault;
-    // We are doing max_smem/2 instead of max_smem because the kernel may need to double-buffer KV tiles.
+    // We are doing max_smem such that the kernel need to double-buffer KV tiles.
     while (bc >= kFlashBcMin && smem_bytes_for(bc, D) > static_cast<size_t>(max_smem))
         bc >>= 1;
     return (bc >= kFlashBcMin) ? bc : -1;
@@ -44,9 +44,12 @@ static void launch_once(
 ) {
     const dim3 grid(B, H_q, (q_len + kFlashBr - 1) / kFlashBr);
     const dim3 block(kFlashWarps * 32);
-    flash_attn_kernel<<<grid, block, smem, stream>>>(
-        Q, K, V, O, d_Mi, d_Li, B, q_len, kv_len, H_q, H_kv, D, bc
-    );
+#define LAUNCH(D_VAL) flash_attn_kernel<D_VAL><<<grid, block, smem, stream>>>(Q, K, V, O, d_Mi, d_Li, B, q_len, kv_len, H_q, H_kv, bc)
+    if      (D ==  16) { LAUNCH( 16); }
+    else if (D ==  64) { LAUNCH( 64); }
+    else if (D == 128) { LAUNCH(128); }
+    else if (D == 256) { LAUNCH(256); }
+#undef LAUNCH
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -65,11 +68,12 @@ static void run_bench(int B, int kv_len, int H_q, int H_kv, int D,
     const size_t smem = smem_bytes_for(bc, D);
 
     if (smem > 49152) {
-        CUDA_CHECK(cudaFuncSetAttribute(
-            flash_attn_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem)
-        ));
+#define SET_ATTR(D_VAL) cudaFuncSetAttribute(flash_attn_kernel<D_VAL>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem))
+        if      (D ==  16) { CUDA_CHECK(SET_ATTR( 16)); }
+        else if (D ==  64) { CUDA_CHECK(SET_ATTR( 64)); }
+        else if (D == 128) { CUDA_CHECK(SET_ATTR(128)); }
+        else if (D == 256) { CUDA_CHECK(SET_ATTR(256)); }
+#undef SET_ATTR
     }
 
     const size_t Q_n  = static_cast<size_t>(B) * H_q  * q_len  * D;

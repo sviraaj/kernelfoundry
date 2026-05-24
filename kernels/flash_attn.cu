@@ -1,12 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/memcpy_async.h>
 #include <stdint.h>
 #include <cfloat>
 #include <cstdio>
-
-namespace cg = cooperative_groups;
 
 // Holds up to 4 uint32 registers used as mma fragment operands.
 struct WarpFrag {
@@ -67,11 +63,85 @@ __device__ __forceinline__ uint32_t smem_load_frag_b8_trans(const void* addr, in
     return frag;
 }
 
+// Load Q's m16×k16 A-operand from swizzled smem via ldmatrix.x4.
+// q_row_base = rb * 16, k_iter = loop variable k.
+template <int kDHeadDim>
+__device__ __forceinline__ WarpFrag smem_load_frag_a_swizzled(
+    const uint16_t* Q_base, int q_row_base, int k_iter)
+{
+    WarpFrag frag = {{0u, 0u, 0u, 0u}};
+    constexpr int kChunksPerRow = kDHeadDim / 8;
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int row       = lane & 15;
+    const int col_group = (lane >> 4) & 1;
+    const int global_chunk = k_iter * 2 + col_group;
+    const int abs_row   = q_row_base + row;
+    const int phys_chunk = global_chunk ^ (abs_row & (kChunksPerRow - 1));
+    const char* ptr = reinterpret_cast<const char*>(Q_base)
+                    + (abs_row * kDHeadDim + phys_chunk * 8) * sizeof(uint16_t);
+    const uint32_t sptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(frag.reg[0]), "=r"(frag.reg[1]), "=r"(frag.reg[2]), "=r"(frag.reg[3])
+        : "r"(sptr));
+    return frag;
+}
+
+// Load K's k16×n8 B-operand from swizzled smem via ldmatrix.x2.
+// k_row_base = cb * 8, k_iter = loop variable k.
+template <int kDHeadDim>
+__device__ __forceinline__ WarpFrag smem_load_frag_b_swizzled(
+    const uint16_t* K_base, int k_row_base, int k_iter)
+{
+    WarpFrag frag = {{0u, 0u, 0u, 0u}};
+    constexpr int kChunksPerRow = kDHeadDim / 8;
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int row       = lane & 7;
+    const int col_group = (lane >> 3) & 1;
+    const int global_chunk = k_iter * 2 + col_group;
+    const int abs_row   = k_row_base + row;
+    const int phys_chunk = global_chunk ^ (abs_row & (kChunksPerRow - 1));
+    const char* ptr = reinterpret_cast<const char*>(K_base)
+                    + (abs_row * kDHeadDim + phys_chunk * 8) * sizeof(uint16_t);
+    const uint32_t sptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+        : "=r"(frag.reg[0]), "=r"(frag.reg[1])
+        : "r"(sptr));
+    return frag;
+}
+
+// Load V's k8×n8 B-operand (transposed) from swizzled smem via ldmatrix.x1.trans.
+// v_row_base = cb * 8, co = D-column block index.
+template <int kDHeadDim>
+__device__ __forceinline__ uint32_t smem_load_frag_b8_trans_swizzled(
+    const uint16_t* V_base, int v_row_base, int co)
+{
+    uint32_t frag = 0u;
+    constexpr int kChunksPerRow = kDHeadDim / 8;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int row   = lane & 7;
+    const int abs_row    = v_row_base + row;
+    const int phys_chunk = co ^ (abs_row & (kChunksPerRow - 1));
+    const char* ptr = reinterpret_cast<const char*>(V_base)
+                    + (abs_row * kDHeadDim + phys_chunk * 8) * sizeof(uint16_t);
+    const uint32_t sptr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];\n"
+        : "=r"(frag)
+        : "r"(sptr));
+    return frag;
+}
+
+// kDHeadDim is a compile-time constant, so:
+//   - k_tiles and the k-loop bound are compile-time → fully unrolled
+//   - o_frag co-loop bound is compile-time → fully unrolled, no local-memory spill
+//   - scale is constant-folded by the compiler
+template <int kDHeadDim>
 __device__ void warp_flash_attn(
     const uint16_t* Q,
     const uint16_t* K,
-    const uint16_t* V,   // full [DHeadDim, Bc_total] col-major smem block
-    int DHeadDim,
+    const uint16_t* V,   // full [kDHeadDim, Bc_total] col-major smem block
     int active_q_rows,
     int active_kv_cols,
     float& mi_u, float& mi_l,
@@ -82,27 +152,20 @@ __device__ void warp_flash_attn(
     if (Q == nullptr || K == nullptr) {
         return;
     }
-    if (DHeadDim < 16 || active_q_rows <= 0 || active_kv_cols <= 0) {
+    if (active_q_rows <= 0 || active_kv_cols <= 0) {
         return;
     }
 
     const int lane    = static_cast<int>(threadIdx.x) & 31;
-    const int k_tiles = DHeadDim >> 4;
+    constexpr int k_tiles     = kDHeadDim >> 4;
     const int c_col_tiles = (active_kv_cols + 7) >> 3;
-
-    // Byte width of one 16-element fp16 tile-column and one 8-element fp32 tile-column.
-    const int qk_tile_bytes = 16 * sizeof(uint16_t);
-    const int c_tile_bytes  =  8 * sizeof(float);
-
-    const char* Q_bytes = reinterpret_cast<const char*>(Q);
-    const char* K_bytes = reinterpret_cast<const char*>(K);
 
 
     #ifdef DEBUG__
         const int c_row_tiles = (active_q_rows + 15) >> 4;
         printf("warp_flash_attn: block=(%d,%d,%d) threadIdx.x=%d DHeadDim=%d active_q_rows=%d active_kv_cols=%d c_row_tiles=%d c_col_tiles=%d k_tiles=%d Q=%p K=%p\n",
                 blockIdx.x, blockIdx.y, blockIdx.z,
-                threadIdx.x, DHeadDim, active_q_rows, active_kv_cols, c_row_tiles, c_col_tiles, k_tiles, Q, K);
+                threadIdx.x, kDHeadDim, active_q_rows, active_kv_cols, c_row_tiles, c_col_tiles, k_tiles, Q, K);
     #endif
 
     const int c_lane_col = (lane & 3) << 1;
@@ -119,18 +182,10 @@ __device__ void warp_flash_attn(
 
         float c_frag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+        #pragma unroll
         for (int k = 0; k < k_tiles; ++k) {
-            const char* q_tile_ptr = Q_bytes + rb * qk_tile_bytes * DHeadDim       + k * qk_tile_bytes;
-            const char* k_tile_ptr = K_bytes + cb * qk_tile_bytes * (DHeadDim / 2) + k * qk_tile_bytes;
-
-#ifdef DEBUG__
-            printf("warp_flash_attn tile: block=(%d,%d,%d) threadIdx.x=%d rb=%d cb=%d k=%d lane=%d q_tile=%p k_tile=%p\n",
-                blockIdx.x, blockIdx.y, blockIdx.z,
-                threadIdx.x, rb, cb, k, lane, q_tile_ptr, k_tile_ptr);
-#endif
-
-            const WarpFrag q_frag = smem_load_frag_a(q_tile_ptr, DHeadDim);
-            const WarpFrag k_frag = smem_load_frag_b(k_tile_ptr, DHeadDim);
+            const WarpFrag q_frag = smem_load_frag_a_swizzled<kDHeadDim>(Q, rb * 16, k);
+            const WarpFrag k_frag = smem_load_frag_b_swizzled<kDHeadDim>(K, cb * 8, k);
 
 #ifdef DEBUG__
             // Each uint32 register holds two fp16 values: low=bits[15:0], high=bits[31:16]
@@ -171,12 +226,12 @@ __device__ void warp_flash_attn(
         }
         // Flash Attention online softmax update — fires once per (rb, cb) after all
         // k-tiles have been accumulated into c_frag.
-        // Step 1: scale QK^T by 1/sqrt(DHeadDim) and compute per-row max.
+        // Step 1: scale QK^T by 1/sqrt(kDHeadDim) and compute per-row max.
         // MMA output layout (m16n8k16): lane t owns
         //   c_frag[0,1] -> row (t>>2),   cols (t&3)*2 and (t&3)*2+1
         //   c_frag[2,3] -> row (t>>2)+8, same cols
         // Lanes 4t..4t+3 share the same row; reduce across bits [1:0] via xor-shuffle.
-        const float scale = 1.0f / sqrtf(static_cast<float>(DHeadDim));
+        const float scale = 1.0f / sqrtf(static_cast<float>(kDHeadDim));
         c_frag[0] *= scale; c_frag[1] *= scale;
         c_frag[2] *= scale; c_frag[3] *= scale;
 
@@ -252,11 +307,13 @@ __device__ void warp_flash_attn(
         const float rescale_l = expf(mi_old_l - mnl);
 
         // Iterate over 8-wide column tiles of O (and V).
-        for (int co = 0; co < DHeadDim / 8; ++co) {
+        // Loop bound is compile-time → fully unrolled; o_frag[co] maps to named registers,
+        // eliminating the local-memory (stack) spill seen with a runtime DHeadDim.
+        #pragma unroll
+        for (int co = 0; co < kDHeadDim / 8; ++co) {
             // B operand [k=8, n=8]: load the V tile through ldmatrix.trans so
             // row-major shared memory is consumed as the col-major fragment MMA expects.
-            const uint16_t* v_tile = V + cb * 8 * DHeadDim + co * 8;
-            const uint32_t b0 = smem_load_frag_b8_trans(v_tile, DHeadDim);
+            const uint32_t b0 = smem_load_frag_b8_trans_swizzled<kDHeadDim>(V, cb * 8, co);
 
 #ifdef DEBUG__
             {
@@ -297,11 +354,10 @@ __device__ void warp_flash_attn(
 //
 // Caller must set cudaFuncAttributeMaxDynamicSharedMemorySize before launch
 // if the computed smem_bytes exceeds the default 48 KB.
-static constexpr int kFlashWarps     = 4;
-static constexpr int kFlashBr        = kFlashWarps * 16;
-static constexpr int kFlashBcDefault = 128;
-static constexpr int kFlashBcMin     = 8;
-static constexpr int kFlashDMax      = 256;
+static constexpr int kFlashWarps                    = 4;
+static constexpr int kFlashBr                       = kFlashWarps * 16;
+[[maybe_unused]] static constexpr int kFlashBcDefault = 128;
+[[maybe_unused]] static constexpr int kFlashBcMin     = 8;
 
 // flash_attn_kernel — top-level Flash Attention kernel.
 //
@@ -314,14 +370,18 @@ static constexpr int kFlashDMax      = 256;
 //   Li [B, H_q,  S]    fp32  (running per-row sum-of-exp; initialized to 0 inside)
 //
 // Dynamic shared memory (pass smem_bytes at launch):
-//   smem_bytes = (kFlashBr + 4*kv_block_rows) * DHeadDim * sizeof(uint16_t)
+//   smem_bytes = (kFlashBr + 4*kv_block_rows) * kDHeadDim * sizeof(uint16_t)
 //   For D=128, kv_block_rows=64:  (64+256)*128*2 = 81920 B ≈ 80 KB ✓
 //   For D=256, kv_block_rows=32:  (64+128)*256*2 = 98304 B ≈ 96 KB ✓
 //   Caller must call cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize,
 //       smem_bytes) before the first launch when smem_bytes > 49152.
 //
 // Grid : dim3(batch_size, q_heads, ceil(S / kFlashBr))
-// Block: dim3(kFlashWarps * 32)   →   32 threads when kFlashWarps = 1
+// Block: dim3(kFlashWarps * 32)   →   128 threads when kFlashWarps = 4
+//
+// kDHeadDim is a compile-time template parameter. The launcher dispatches to the
+// correct instantiation based on the runtime head dimension.
+template <int kDHeadDim>
 __global__ void flash_attn_kernel(
     const uint16_t* __restrict__ Q,
     const uint16_t* __restrict__ K,
@@ -334,8 +394,7 @@ __global__ void flash_attn_kernel(
     int kv_len,       // key/value sequence length
     int q_heads,
     int kv_heads,
-    int DHeadDim,     // must be a multiple of 16
-    int kv_block_rows // must be a positive multiple of 8 -- for double-buffering K/V tiles in smem; runtime-tunable for best performance based on D and smem availability
+    int kv_block_rows // must be a positive multiple of 8; runtime-tunable for best performance
 ) {
     const int b      = static_cast<int>(blockIdx.x);
     const int h_q    = static_cast<int>(blockIdx.y);
@@ -351,28 +410,28 @@ __global__ void flash_attn_kernel(
     const int q_rows = min(kFlashBr, q_len - q_row_start);
 
     // [B, H, S, D]: within a head, rows are contiguous in memory.
-    const uint16_t* Q_block  = Q  + (b * q_heads  + h_q)  * q_len  * DHeadDim
-                                  + q_row_start * DHeadDim;
-    const uint16_t* K_head   = K  + (b * kv_heads + h_kv) * kv_len * DHeadDim;
-    const uint16_t* V_head   = V  + (b * kv_heads + h_kv) * kv_len * DHeadDim;
-    float*          O_block  = O  + (b * q_heads  + h_q)  * q_len  * DHeadDim
-                                  + q_row_start * DHeadDim;
+    const uint16_t* Q_block  = Q  + (b * q_heads  + h_q)  * q_len  * kDHeadDim
+                                  + q_row_start * kDHeadDim;
+    const uint16_t* K_head   = K  + (b * kv_heads + h_kv) * kv_len * kDHeadDim;
+    const uint16_t* V_head   = V  + (b * kv_heads + h_kv) * kv_len * kDHeadDim;
+    float*          O_block  = O  + (b * q_heads  + h_q)  * q_len  * kDHeadDim
+                                  + q_row_start * kDHeadDim;
     float*          Mi_block = Mi + (b * q_heads  + h_q)  * q_len  + q_row_start;
     float*          Li_block = Li + (b * q_heads  + h_q)  * q_len  + q_row_start;
 
     // Carve dynamic shared memory (double-buffered K/V for cp.async pipelining):
-    //   smem_q    [kFlashBr * DHeadDim]       fp16  (Q tile, single buffer)
-    //   smem_k[0] [kv_block_rows * DHeadDim]  fp16  (K ping)
-    //   smem_v[0] [kv_block_rows * DHeadDim]  fp16  (V ping)
-    //   smem_k[1] [kv_block_rows * DHeadDim]  fp16  (K pong)
-    //   smem_v[1] [kv_block_rows * DHeadDim]  fp16  (V pong)
-    // Total: (kFlashBr + 4 * kv_block_rows) * DHeadDim * sizeof(fp16)
+    //   smem_q    [kFlashBr * kDHeadDim]       fp16  (Q tile, single buffer)
+    //   smem_k[0] [kv_block_rows * kDHeadDim]  fp16  (K ping)
+    //   smem_v[0] [kv_block_rows * kDHeadDim]  fp16  (V ping)
+    //   smem_k[1] [kv_block_rows * kDHeadDim]  fp16  (K pong)
+    //   smem_v[1] [kv_block_rows * kDHeadDim]  fp16  (V pong)
+    // Total: (kFlashBr + 4 * kv_block_rows) * kDHeadDim * sizeof(fp16)
     extern __shared__ char smem_raw[];
-    const int    kv_buf_elems  = kv_block_rows * DHeadDim;
+    const int    kv_buf_elems  = kv_block_rows * kDHeadDim;
     uint16_t*    smem_q        = reinterpret_cast<uint16_t*>(smem_raw);
     uint16_t*    smem_k_buf[2] = {
-        smem_q + kFlashBr * DHeadDim,
-        smem_q + kFlashBr * DHeadDim + 2 * kv_buf_elems
+        smem_q + kFlashBr * kDHeadDim,
+        smem_q + kFlashBr * kDHeadDim + 2 * kv_buf_elems
     };
     uint16_t*    smem_v_buf[2] = {
         smem_k_buf[0] + kv_buf_elems,
@@ -384,10 +443,18 @@ __global__ void flash_attn_kernel(
     const int warp_id = tid >> 5;
 
 
-    // Load Q tile into smem (contiguous in [B,H,S,D]).
-    for (int i = tid; i < kFlashBr * DHeadDim; i += blockDim.x) {
-        const int r = i / DHeadDim;
-        smem_q[i] = (r < q_rows) ? Q_block[i] : static_cast<uint16_t>(0);
+    // Load Q tile into smem with XOR swizzle (per-chunk uint4 writes).
+    constexpr int kChunksPerRow = kDHeadDim / 8;
+    for (int ci = tid; ci < kFlashBr * kChunksPerRow; ci += bdim) {
+        const int row   = ci / kChunksPerRow;
+        const int chunk = ci % kChunksPerRow;
+        const int phys_chunk = chunk ^ (row & (kChunksPerRow - 1));
+        uint4* dst = reinterpret_cast<uint4*>(smem_q) + row * kChunksPerRow + phys_chunk;
+        if (row < q_rows) {
+            *dst = reinterpret_cast<const uint4*>(Q_block)[row * kChunksPerRow + chunk];
+        } else {
+            *dst = make_uint4(0, 0, 0, 0);
+        }
     }
     __syncthreads();
 
@@ -397,34 +464,52 @@ __global__ void flash_attn_kernel(
     //   prologue : zero buf[0], async-copy tile 0 → buf[0], wait
     //   loop i   : async-copy tile i+1 → buf[1-cur]   (overlaps with compute below)
     //              warp_flash_attn on buf[cur]
-    //              wait for tile i+1  (cg::wait = barrier + async drain)
+    //              wait for tile i+1  (wait_async = cp.async.wait_group + __syncthreads)
     //              swap cur
     //
     // The zero-before-copy ensures out-of-bounds rows (edge tile) read as zero
     // inside warp_flash_attn, matching the previous conditional-store behaviour.
     const int kv_tiles = (kv_len + kv_block_rows - 1) / kv_block_rows;
-    auto blk = cg::this_thread_block();
 
-    // Issue async load of tile t into double-buffer slot buf.
+    auto wait_async = [&]() {
+        asm volatile("cp.async.wait_group 0;\n" :::);
+        __syncthreads();
+    };
+
+    // Issue async load of tile t into double-buffer slot buf with XOR swizzle.
     // __syncthreads() inside guarantees all threads finish zeroing before the
     // async copy engine starts writing (prevents write-after-write on padding).
     auto async_load_kv = [&](int t, int buf) {
         const int ks = t * kv_block_rows;
         const int kr = min(kv_block_rows, kv_len - ks);
+        constexpr int kChunksPerRow = kDHeadDim / 8;
         for (int i = tid; i < kv_buf_elems; i += bdim) {
             smem_k_buf[buf][i] = 0;
             smem_v_buf[buf][i] = 0;
         }
         __syncthreads();
-        cg::memcpy_async(blk, smem_k_buf[buf], K_head + ks * DHeadDim,
-                         static_cast<size_t>(kr) * DHeadDim * sizeof(uint16_t));
-        cg::memcpy_async(blk, smem_v_buf[buf], V_head + ks * DHeadDim,
-                         static_cast<size_t>(kr) * DHeadDim * sizeof(uint16_t));
+        const int total_ops = kr * kChunksPerRow;
+        for (int ci = tid; ci < total_ops; ci += bdim) {
+            const int row   = ci / kChunksPerRow;
+            const int chunk = ci % kChunksPerRow;
+            const int phys_chunk = chunk ^ (row & (kChunksPerRow - 1));
+            const uint16_t* src_k = K_head + (ks + row) * kDHeadDim + chunk * 8;
+            const uint16_t* src_v = V_head + (ks + row) * kDHeadDim + chunk * 8;
+            uint16_t* dst_k = smem_k_buf[buf] + row * kDHeadDim + phys_chunk * 8;
+            uint16_t* dst_v = smem_v_buf[buf] + row * kDHeadDim + phys_chunk * 8;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_k))),
+                   "l"(static_cast<const void*>(src_k)));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_v))),
+                   "l"(static_cast<const void*>(src_v)));
+        }
+        asm volatile("cp.async.commit_group;\n" :::);
     };
 
     // Prologue: fill buf[0] with tile 0 and wait before entering the loop.
     async_load_kv(0, 0);
-    cg::wait(blk);
+    wait_async();
 
 
     int cur = 0;
@@ -435,7 +520,10 @@ __global__ void flash_attn_kernel(
     const int rb = (warp_id < c_row_tiles) ? warp_id : -1;
 
     // O, Mi, Li accumulators in registers — no HBM round-trip per KV tile.
-    float o_frag[kFlashDMax / 8][4] = {};
+    // kDHeadDim is compile-time, so this array size is known at compile time.
+    // With full loop unrolling in warp_flash_attn, every o_frag[co] becomes a named
+    // register group — no spill to the per-thread local memory depot.
+    float o_frag[kDHeadDim / 8][4] = {};
     float mi_u_reg = -FLT_MAX, mi_l_reg = -FLT_MAX;
     float li_u_reg = 0.0f,     li_l_reg = 0.0f;
 
@@ -455,14 +543,14 @@ __global__ void flash_attn_kernel(
             async_load_kv(kv_tile + 1, 1 - cur);
 
         if (rb >= 0)
-            warp_flash_attn(
+            warp_flash_attn<kDHeadDim>(
                 smem_q, smem_k_buf[cur], smem_v_buf[cur],
-                DHeadDim, q_rows, kv_rows,
+                q_rows, kv_rows,
                 mi_u_reg, mi_l_reg, li_u_reg, li_l_reg, o_frag, rb
             );
 
         if (kv_tile + 1 < kv_tiles) {
-            cg::wait(blk);
+            wait_async();
             cur ^= 1;
         }
     }
@@ -470,9 +558,10 @@ __global__ void flash_attn_kernel(
 
     // Write O, Mi, Li from registers to HBM once, after sweeping all KV tiles.
     if (rb >= 0) {
-        for (int co = 0; co < DHeadDim / 8; ++co) {
-            const int o_u_offset = row_u * DHeadDim + co * 8 + c_lane_col;
-            const int o_l_offset = row_l * DHeadDim + co * 8 + c_lane_col;
+        #pragma unroll
+        for (int co = 0; co < kDHeadDim / 8; ++co) {
+            const int o_u_offset = row_u * kDHeadDim + co * 8 + c_lane_col;
+            const int o_l_offset = row_l * kDHeadDim + co * 8 + c_lane_col;
             if (row_u_valid) {
                 O_block[o_u_offset]     = o_frag[co][0];
                 O_block[o_u_offset + 1] = o_frag[co][1];
@@ -491,6 +580,21 @@ __global__ void flash_attn_kernel(
     __syncthreads();
 
     // Normalize: O[row, :] /= Li[row].
-    for (int i = tid; i < q_rows * DHeadDim; i += blockDim.x)
-        O_block[i] /= Li_block[i / DHeadDim];
+    for (int i = tid; i < q_rows * kDHeadDim; i += blockDim.x)
+        O_block[i] /= Li_block[i / kDHeadDim];
 }
+
+// Explicit instantiations — one per supported head dimension.
+// Add a new line here (and a case in the launcher) when supporting a new D value.
+template __global__ void flash_attn_kernel<16>(
+    const uint16_t*, const uint16_t*, const uint16_t*,
+    float*, float*, float*, int, int, int, int, int, int);
+template __global__ void flash_attn_kernel<64>(
+    const uint16_t*, const uint16_t*, const uint16_t*,
+    float*, float*, float*, int, int, int, int, int, int);
+template __global__ void flash_attn_kernel<128>(
+    const uint16_t*, const uint16_t*, const uint16_t*,
+    float*, float*, float*, int, int, int, int, int, int);
+template __global__ void flash_attn_kernel<256>(
+    const uint16_t*, const uint16_t*, const uint16_t*,
+    float*, float*, float*, int, int, int, int, int, int);

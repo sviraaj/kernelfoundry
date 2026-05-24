@@ -71,39 +71,34 @@ inline cudaError_t launch_flash_attn(
 
     const size_t smem_bytes = flash_smem_bytes_for(kv_block_rows, D);
 
-    if (smem_bytes > 49152) {
-        err = cudaFuncSetAttribute(
-            flash_attn_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem_bytes)
-        );
-        if (err != cudaSuccess) { cudaFree(d_Mi); cudaFree(d_Li); return err; }
-    }
-
     const dim3 grid(B, H_q, (S + kFlashBr - 1) / kFlashBr);
     const dim3 block(kFlashWarps * 32);
 
-    std::cout << "    launch flash_attn_kernel"
-              << " grid=(" << grid.x << ", " << grid.y << ", " << grid.z << ")"
-              << " block=(" << block.x << ", " << block.y << ", " << block.z << ")"
-              << " smem_bytes=" << smem_bytes
-              << " kv_block_rows=" << kv_block_rows
-              << " params={B=" << B
-              << ", S=" << S
-              << ", H_q=" << H_q
-              << ", H_kv=" << H_kv
-              << ", D=" << D
-              << ", Q=" << static_cast<const void*>(Q)
-              << ", K=" << static_cast<const void*>(K)
-              << ", V=" << static_cast<const void*>(V)
-              << ", O=" << static_cast<void*>(O)
-              << ", Mi=" << static_cast<void*>(d_Mi)
-              << ", Li=" << static_cast<void*>(d_Li)
-              << "}\n";
+#define SET_ATTR_AND_LAUNCH(D_VAL)                                                  \
+    do {                                                                            \
+        if (smem_bytes > 49152) {                                                   \
+            err = cudaFuncSetAttribute(                                             \
+                flash_attn_kernel<D_VAL>,                                          \
+                cudaFuncAttributeMaxDynamicSharedMemorySize,                        \
+                static_cast<int>(smem_bytes));                                      \
+            if (err != cudaSuccess) { cudaFree(d_Mi); cudaFree(d_Li); return err; }\
+        }                                                                           \
+        std::cout << "    launch flash_attn_kernel<" << D_VAL << ">"               \
+                  << " grid=(" << grid.x << "," << grid.y << "," << grid.z << ")"  \
+                  << " smem=" << smem_bytes                                         \
+                  << " bc=" << kv_block_rows                                        \
+                  << " {B=" << B << " S=" << S                                      \
+                  << " H_q=" << H_q << " H_kv=" << H_kv << "}\n";                  \
+        flash_attn_kernel<D_VAL><<<grid, block, smem_bytes, stream>>>(              \
+            Q, K, V, O, d_Mi, d_Li, B, S, S, H_q, H_kv, kv_block_rows);           \
+    } while (0)
 
-    flash_attn_kernel<<<grid, block, smem_bytes, stream>>>(
-        Q, K, V, O, d_Mi, d_Li, B, S, S, H_q, H_kv, D, kv_block_rows
-    );
+    if      (D ==  16) { SET_ATTR_AND_LAUNCH( 16); }
+    else if (D ==  64) { SET_ATTR_AND_LAUNCH( 64); }
+    else if (D == 128) { SET_ATTR_AND_LAUNCH(128); }
+    else if (D == 256) { SET_ATTR_AND_LAUNCH(256); }
+    else { cudaFree(d_Mi); cudaFree(d_Li); return cudaErrorInvalidValue; }
+#undef SET_ATTR_AND_LAUNCH
 
     err = cudaGetLastError();
     if (err == cudaSuccess) {

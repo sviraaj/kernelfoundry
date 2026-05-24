@@ -12,36 +12,52 @@ Each kernel ships with a NumPy reference model that mirrors the exact tile geome
 
 | Kernel | Status | Features |
 |--------|:------:|----------|
-| Flash Attention | ✅ v2 | GQA / MQA, m16n8k16 + m16n8k8 MMA, online softmax, decode (Q_len=1), cp.async KV double-buffering, O/Mi/Li in registers |
+| Flash Attention | ✅ v2 | GQA / MQA, m16n8k16 + m16n8k8 MMA, online softmax, decode (Q_len=1), cp.async KV double-buffering, O/Mi/Li in registers, template-D (zero register spill), XOR smem swizzle |
 | RMSNorm | 🔲 | — |
 | RoPE | 🔲 | — |
 | SwiGLU | 🔲 | — |
 
 ---
 
-## Flash Attention — v1 Numbers
+## Flash Attention — Performance
 
-**RTX 5070 · H_q=32, H_kv=8 (GQA 4:1), D=128, fp16 in / fp32 out · v2 (O/Mi/Li in registers, cp.async KV double-buffering)**
+**RTX 5070 · Blackwell sm_120 · H_q=32, H_kv=8 (GQA 4:1), D=128, fp16 in / fp32 out**
 
-**Prefill** (Q_len = KV_len):
+### Optimization history
 
-| Seq len | Latency   | TFLOPS |
-|--------:|----------:|-------:|
-| 512     |  0.931 ms |   4.61 |
-| 1024    |  3.251 ms |   5.29 |
-| 2048    | 12.221 ms |   5.62 |
-| 4096    | 44.515 ms |   6.18 |
+Each row is a single incremental change on top of the previous.
 
-**Decode** (Q_len=1, full KV cache):
+| Stage | Optimization | Prefill S=1024 | Prefill S=4096 | Decode KV=4096 | vs v1 |
+|------:|---|---:|---:|---:|---:|
+| v1 | Baseline — synchronous KV loads, O written to HBM each KV tile | 10.46 ms · 1.64T | 158.2 ms · 1.74T | — | 1.0× |
+| v2a | **cp.async KV double-buffering** — async copy overlaps HBM→smem with MMA | 3.34 ms · 5.14T | 46.0 ms · 5.97T | 0.55 ms | 3.1× |
+| v2b | **O / Mi / Li in registers** — accumulators stay in RF across all KV tiles | 3.25 ms · 5.29T | 44.5 ms · 6.18T | 0.57 ms | 3.2× |
+| v2c | **Template-D + o_frag unroll** — eliminates 544-byte register spill to local memory | 1.79 ms · 9.62T | 25.7 ms · 10.7T | 0.44 ms | 5.9× |
+| v2d | **XOR smem swizzle** — eliminates 8-way ldmatrix bank conflicts on K/V reads | **1.03 ms · 16.7T** | **14.3 ms · 19.3T** | **0.30 ms** | **10.1×** |
 
-| KV cache len | Latency  |
-|-------------:|---------:|
-| 512          | 0.082 ms |
-| 1024         | 0.148 ms |
-| 2048         | 0.286 ms |
-| 4096         | 0.571 ms |
+### vs PyTorch SDPA (FA2 backend)
 
-Compare with PyTorch FA2 (SDPA): `python reference_benchmarks/bench_flash_attn2.py`
+Same hardware, same shapes. SDPA uses the FlashAttention-2 backend with Blackwell-optimized kernels (WGMMA, TMA).
+
+**Prefill** (Q_len = KV_len, B=1):
+
+| Seq len | Ours | SDPA | Gap |
+|--------:|-----:|-----:|----:|
+| 512  |  0.305 ms · 14.1T |  0.091 ms · 47.1T | 3.4× |
+| 1024 |  1.028 ms · 16.7T |  0.332 ms · 51.8T | 3.1× |
+| 2048 |  3.866 ms · 17.8T |  1.208 ms · 56.9T | 3.2× |
+| 4096 | 14.279 ms · 19.3T |  4.810 ms · 57.1T | 3.0× |
+
+**Decode** (Q_len=1, B=1, full KV cache):
+
+| KV cache len | Ours | SDPA | Gap |
+|-------------:|-----:|-----:|----:|
+|  512 | 0.040 ms | 0.023 ms | 1.7× |
+| 1024 | 0.078 ms | 0.029 ms | 2.7× |
+| 2048 | 0.165 ms | 0.049 ms | 3.4× |
+| 4096 | 0.303 ms | 0.119 ms | 2.5× |
+
+Run the reference benchmark: `python reference_benchmarks/bench_flash_attn2.py`
 
 ---
 
